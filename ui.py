@@ -33,12 +33,12 @@ C_DOWN_TEXT   = "#d50000"
 # ── Fonts ─────────────────────────────────────────────────────
 F_TITLE    = ("Courier", 13, "bold")
 F_BTN      = ("Courier", 20, "bold")
-F_LABEL    = ("Courier",  9, "bold")
+F_LABEL    = ("Courier", 11, "bold")
 F_CONSOLE  = ("Courier", 10)
-F_VALUE    = ("Courier", 10, "bold")
+F_VALUE    = ("Courier", 12, "bold")
 F_STATUS   = ("Courier", 12, "bold")
 F_MOTOR    = ("Courier", 16, "bold")
-F_SECTION  = ("Courier",  9, "bold")
+F_SECTION  = ("Courier", 11, "bold")
 
 
 def get_pi_temp() -> str:
@@ -254,7 +254,7 @@ class MotorControlApp:
         for i, (key, label, default, _) in enumerate(rows, start=1):
             if key.startswith("_hdr"):
                 # Section divider
-                tk.Label(frame, text=label, font=("Courier", 8, "bold"),
+                tk.Label(frame, text=label, font=("Courier", 9, "bold"),
                          bg=C_PANEL, fg=C_DIM).grid(
                              row=i, column=0, columnspan=2,
                              sticky="w", padx=14, pady=(8, 2))
@@ -275,7 +275,7 @@ class MotorControlApp:
             row=len(rows) + 2, column=0, columnspan=2,
             sticky="ew", padx=10, pady=8)
         tk.Button(frame, text="[ QUIT ]",
-                  font=("Courier", 10, "bold"),
+                  font=("Courier", 12, "bold"),
                   bg=C_PANEL, fg=C_RED,
                   activebackground=C_PANEL,
                   relief="flat",
