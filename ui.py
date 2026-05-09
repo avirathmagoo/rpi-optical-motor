@@ -1,45 +1,53 @@
 #!/usr/bin/env python3
 """
-ui.py  —  v2.0
+ui.py  —  v3.0
 Industrial SCADA-style touchscreen UI for motor control.
-Pure tkinter, no external UI libraries.
-Buttons change color only on press, not on hover.
+- Opens instantly even without Ethernet connected
+- Fullscreen on launch
+- Shutdown Pi button built in
+- Quit button for development only
+- Pure tkinter, no external UI libraries
 """
 
 import tkinter as tk
+import tkinter.messagebox as msgbox
 import time
 import subprocess
+import os
 from motor_daemon import MotorDaemon, CMD_STOP, CMD_UP, CMD_DOWN
 
 # ── Refresh rate ──────────────────────────────────────────────
-REFRESH_MS = 250   # UI polls status at 4Hz
+REFRESH_MS = 250
 
 # ── Color palette — industrial dark theme ─────────────────────
-C_BG          = "#0d0d0d"   # Near-black background
-C_PANEL       = "#141414"   # Slightly lighter panel
-C_BORDER      = "#2a2a2a"   # Subtle borders
-C_ACCENT      = "#c8a800"   # Amber — industrial accent
-C_TEXT        = "#d0d0d0"   # Main text
-C_DIM         = "#555555"   # Dimmed / label text
-C_GREEN       = "#00c853"   # Connected / OK
-C_RED         = "#d50000"   # Fault / disconnected
-C_YELLOW      = "#ffd600"   # Warning
-C_BTN_NORMAL  = "#1a1a1a"   # Button resting state
-C_BTN_PRESS   = "#c8a800"   # Button pressed — amber flash
-C_BTN_BORDER  = "#333333"
-C_UP_TEXT     = "#00c853"
-C_DOWN_TEXT   = "#d50000"
+C_BG         = "#0d0d0d"
+C_PANEL      = "#141414"
+C_BORDER     = "#2a2a2a"
+C_ACCENT     = "#c8a800"
+C_TEXT       = "#d0d0d0"
+C_DIM        = "#555555"
+C_GREEN      = "#00c853"
+C_RED        = "#d50000"
+C_YELLOW     = "#ffd600"
+C_BTN_NORMAL = "#1a1a1a"
+C_BTN_PRESS  = "#c8a800"
+C_BTN_BORDER = "#333333"
+C_UP_TEXT    = "#00c853"
+C_DOWN_TEXT  = "#d50000"
+C_SHUTDOWN   = "#8b0000"
 
-# ── Fonts ─────────────────────────────────────────────────────
-F_TITLE    = ("Courier", 13, "bold")
-F_BTN      = ("Courier", 20, "bold")
-F_LABEL    = ("Courier", 14, "bold")
-F_CONSOLE  = ("Courier", 10)
-F_VALUE    = ("Courier", 15, "bold")
-F_STATUS   = ("Courier", 12, "bold")
-F_MOTOR    = ("Courier", 16, "bold")
-F_SECTION  = ("Courier", 14, "bold")
+# ── Fonts (customised by user) ────────────────────────────────
+F_TITLE   = ("Courier", 13, "bold")
+F_BTN     = ("Courier", 20, "bold")
+F_LABEL   = ("Courier", 11, "bold")
+F_CONSOLE = ("Courier", 10)
+F_VALUE   = ("Courier", 12, "bold")
+F_STATUS  = ("Courier", 12, "bold")
+F_MOTOR   = ("Courier", 16, "bold")
+F_SECTION = ("Courier", 11, "bold")
 
+
+# ── System helpers ────────────────────────────────────────────
 
 def get_pi_temp() -> str:
     try:
@@ -62,21 +70,23 @@ def get_pi_uptime() -> str:
 
 def get_cpu_percent() -> str:
     try:
-        result = subprocess.run(
-            ["top", "-bn1"],
-            capture_output=True, text=True, timeout=1
-        )
-        for line in result.stdout.splitlines():
-            if "Cpu(s)" in line or "%Cpu" in line:
-                # Parse idle and subtract from 100
-                parts = line.split()
-                for i, p in enumerate(parts):
-                    if "id" in p and i > 0:
-                        idle = float(parts[i-1].replace(",", "."))
-                        return f"{100 - idle:.1f}%"
+        with open("/proc/stat") as f:
+            line = f.readline()
+        fields = [float(x) for x in line.strip().split()[1:]]
+        idle  = fields[3]
+        total = sum(fields)
+        if not hasattr(get_cpu_percent, "_prev"):
+            get_cpu_percent._prev = (idle, total)
+            return "—"
+        prev_idle, prev_total = get_cpu_percent._prev
+        get_cpu_percent._prev = (idle, total)
+        d_idle  = idle  - prev_idle
+        d_total = total - prev_total
+        if d_total == 0:
+            return "—"
+        return f"{100.0 * (1.0 - d_idle / d_total):.1f}%"
     except Exception:
-        pass
-    return "N/A"
+        return "N/A"
 
 
 def state_label(state: int) -> str:
@@ -93,6 +103,8 @@ def fmt_session(secs: float) -> str:
     return f"{m:02d}m {s:02d}s"
 
 
+# ── Main application ──────────────────────────────────────────
+
 class MotorControlApp:
     def __init__(self, root: tk.Tk, daemon: MotorDaemon):
         self.root   = root
@@ -104,16 +116,16 @@ class MotorControlApp:
     # ── UI Construction ───────────────────────────────────────
 
     def _build_ui(self):
-        self.root.title("MOTOR CONTROL  v2.0")
+        self.root.title("MOTOR CONTROL  v3.0")
         self.root.configure(bg=C_BG)
         self.root.attributes("-fullscreen", True)
-        self.root.bind("<Escape>", lambda e: self.root.attributes(
-            "-fullscreen", False))
 
-        # ── Top status bar ──
+        # Allow Escape to exit fullscreen during development
+        self.root.bind("<Escape>",
+                       lambda e: self.root.attributes("-fullscreen", False))
+
         self._build_statusbar()
 
-        # ── Main area ──
         main = tk.Frame(self.root, bg=C_BG)
         main.pack(fill=tk.BOTH, expand=True, padx=10, pady=(4, 10))
         main.columnconfigure(0, weight=3)
@@ -129,25 +141,22 @@ class MotorControlApp:
         bar = tk.Frame(self.root, bg=C_PANEL, height=42,
                        highlightbackground=C_ACCENT,
                        highlightthickness=1)
-        bar.pack(fill=tk.X, padx=0, pady=0)
+        bar.pack(fill=tk.X)
         bar.pack_propagate(False)
 
-        # Left: system name
-        tk.Label(bar, text="▶  MOTOR CONTROL SYSTEM  v2.0",
+        tk.Label(bar, text="▶  MOTOR CONTROL SYSTEM  v3.0",
                  font=F_TITLE, bg=C_PANEL, fg=C_ACCENT).pack(
                      side=tk.LEFT, padx=16)
 
-        # Right: connection pill
-        self._conn_var = tk.StringVar(value="● INITIALISING")
-        self._conn_lbl = tk.Label(bar, textvariable=self._conn_var,
-                                  font=F_STATUS, bg=C_PANEL, fg=C_YELLOW)
-        self._conn_lbl.pack(side=tk.RIGHT, padx=16)
-
-        # Right: latency
         self._lat_var = tk.StringVar(value="")
         tk.Label(bar, textvariable=self._lat_var,
                  font=F_CONSOLE, bg=C_PANEL, fg=C_DIM).pack(
                      side=tk.RIGHT, padx=6)
+
+        self._conn_var = tk.StringVar(value="● INITIALISING")
+        self._conn_lbl = tk.Label(bar, textvariable=self._conn_var,
+                                  font=F_STATUS, bg=C_PANEL, fg=C_YELLOW)
+        self._conn_lbl.pack(side=tk.RIGHT, padx=16)
 
     def _build_motor_panel(self, parent, label, motor_id, col):
         outer = tk.Frame(parent, bg=C_BORDER, padx=1, pady=1)
@@ -159,16 +168,14 @@ class MotorControlApp:
         frame.rowconfigure(3, weight=1)
         frame.columnconfigure(0, weight=1)
 
-        # Section header
         tk.Label(frame, text=f"━━  {label}  ━━",
                  font=F_SECTION, bg=C_PANEL, fg=C_ACCENT).grid(
                      row=0, column=0, pady=(10, 4))
 
-        # UP button
         btn_up = tk.Button(
             frame, text="▲\nUP",
             font=F_BTN, bg=C_BTN_NORMAL, fg=C_UP_TEXT,
-            activebackground=C_BTN_NORMAL,   # No hover change
+            activebackground=C_BTN_NORMAL,
             activeforeground=C_UP_TEXT,
             relief="flat", borderwidth=0,
             highlightbackground=C_BTN_BORDER,
@@ -177,22 +184,19 @@ class MotorControlApp:
         )
         btn_up.grid(row=1, column=0, sticky="nsew", padx=12, pady=4)
         btn_up.bind("<ButtonPress-1>",
-                    lambda e, m=motor_id: self._press(m, CMD_UP, btn_up))
+                    lambda e, m=motor_id: self._press(m, CMD_UP, btn_up, "up"))
         btn_up.bind("<ButtonRelease-1>",
-                    lambda e, m=motor_id: self._release(m, btn_up))
+                    lambda e, m=motor_id: self._release(m, btn_up, "up"))
 
-        # State indicator
         state_var = tk.StringVar(value="STOP")
         state_lbl = tk.Label(frame, textvariable=state_var,
-                             font=F_MOTOR, bg=C_PANEL, fg=C_TEXT,
-                             width=6)
+                             font=F_MOTOR, bg=C_PANEL, fg=C_DIM, width=6)
         state_lbl.grid(row=2, column=0, pady=6)
 
-        # DOWN button
         btn_down = tk.Button(
             frame, text="▼\nDOWN",
             font=F_BTN, bg=C_BTN_NORMAL, fg=C_DOWN_TEXT,
-            activebackground=C_BTN_NORMAL,   # No hover change
+            activebackground=C_BTN_NORMAL,
             activeforeground=C_DOWN_TEXT,
             relief="flat", borderwidth=0,
             highlightbackground=C_BTN_BORDER,
@@ -201,9 +205,9 @@ class MotorControlApp:
         )
         btn_down.grid(row=3, column=0, sticky="nsew", padx=12, pady=4)
         btn_down.bind("<ButtonPress-1>",
-                      lambda e, m=motor_id: self._press(m, CMD_DOWN, btn_down))
+                      lambda e, m=motor_id: self._press(m, CMD_DOWN, btn_down, "down"))
         btn_down.bind("<ButtonRelease-1>",
-                      lambda e, m=motor_id: self._release(m, btn_down))
+                      lambda e, m=motor_id: self._release(m, btn_down, "down"))
 
         tk.Frame(frame, bg=C_PANEL, height=8).grid(row=4, column=0)
 
@@ -225,39 +229,37 @@ class MotorControlApp:
 
         tk.Label(frame, text="━━  SYSTEM CONSOLE  ━━",
                  font=F_SECTION, bg=C_PANEL, fg=C_ACCENT).grid(
-                     row=0, column=0, columnspan=2, pady=(10, 8))
+                     row=0, column=0, columnspan=2, pady=(10, 6))
 
-        # Console rows: (key, label, initial, color_fn)
         self._crows = {}
         rows = [
-            # ── Comms ──
-            ("_hdr_comms",   "── COMMUNICATIONS ──", None, None),
-            ("eth_status",   "ETH LINK",       "—",    None),
-            ("latency",      "LATENCY",         "—",    None),
-            ("hb_rate",      "HB RATE",         "—",    None),
-            ("last_pkt_age", "LAST PKT AGE",    "—",    None),
-            ("lost",         "PKTS LOST",       "0",    None),
-            # ── Motors ──
-            ("_hdr_motors",  "── MOTORS ──",    None,   None),
-            ("motor_a",      "MOTOR A",         "STOP", None),
-            ("motor_b",      "MOTOR B",         "STOP", None),
-            ("cmd_source",   "CMD SOURCE",      "—",    None),
-            # ── System ──
-            ("_hdr_sys",     "── SYSTEM ──",    None,   None),
-            ("pi_temp",      "PI TEMP",         "—",    None),
-            ("cpu",          "CPU LOAD",        "—",    None),
-            ("session",      "SESSION TIME",    "—",    None),
-            ("uptime",       "UPTIME",          "—",    None),
-            ("gpio",         "HW BUTTONS",      "—",    None),
+            ("_hdr_comms",   "── COMMUNICATIONS ──", None),
+            ("eth_status",   "ETH LINK",             "—"),
+            ("latency",      "LATENCY",               "—"),
+            ("hb_rate",      "HB RATE",               "—"),
+            ("last_pkt_age", "LAST PKT AGE",          "—"),
+            ("lost",         "PKTS LOST",             "0"),
+            ("_hdr_motors",  "── MOTORS ──",          None),
+            ("motor_a",      "MOTOR A",               "STOP"),
+            ("motor_b",      "MOTOR B",               "STOP"),
+            ("cmd_source",   "CMD SOURCE",            "—"),
+            ("_hdr_sys",     "── SYSTEM ──",          None),
+            ("pi_temp",      "PI TEMP",               "—"),
+            ("cpu",          "CPU LOAD",              "—"),
+            ("session",      "SESSION TIME",          "—"),
+            ("uptime",       "UPTIME",                "—"),
+            ("gpio",         "HW BUTTONS",            "—"),
+            ("socket",       "SOCKET",                "—"),
         ]
 
-        for i, (key, label, default, _) in enumerate(rows, start=1):
+        for i, row in enumerate(rows, start=1):
+            key, label, default = row
             if key.startswith("_hdr"):
-                # Section divider
-                tk.Label(frame, text=label, font=("Courier", 12, "bold"),
+                tk.Label(frame, text=label,
+                         font=("Courier", 9, "bold"),
                          bg=C_PANEL, fg=C_DIM).grid(
                              row=i, column=0, columnspan=2,
-                             sticky="w", padx=14, pady=(8, 2))
+                             sticky="w", padx=14, pady=(6, 1))
                 continue
 
             tk.Label(frame, text=label + ":", font=F_LABEL,
@@ -270,37 +272,67 @@ class MotorControlApp:
             lbl.grid(row=i, column=1, sticky="w", padx=4, pady=1)
             self._crows[key] = (var, lbl)
 
-        # Quit button
+        # ── Divider ──
+        sep_row = len(rows) + 2
         tk.Frame(frame, bg=C_BORDER, height=1).grid(
-            row=len(rows) + 2, column=0, columnspan=2,
+            row=sep_row, column=0, columnspan=2,
             sticky="ew", padx=10, pady=8)
-        tk.Button(frame, text="[ QUIT ]",
-                  font=("Courier", 14, "bold"),
-                  bg=C_PANEL, fg=C_RED,
-                  activebackground=C_PANEL,
-                  relief="flat",
-                  command=self.root.destroy,
-                  cursor="hand2").grid(
-                      row=len(rows) + 3, column=0,
-                      columnspan=2, pady=(0, 10))
+
+        # ── Quit button (development use) ──
+        tk.Button(
+            frame, text="[ QUIT ]",
+            font=("Courier", 10, "bold"),
+            bg=C_PANEL, fg=C_DIM,
+            activebackground=C_PANEL,
+            relief="flat",
+            command=self._quit,
+            cursor="hand2"
+        ).grid(row=sep_row + 1, column=0, columnspan=2, pady=(0, 4))
+
+        # ── Shutdown button ──
+        tk.Button(
+            frame, text="⏻  SHUTDOWN PI",
+            font=("Courier", 11, "bold"),
+            bg=C_SHUTDOWN, fg=C_TEXT,
+            activebackground=C_SHUTDOWN,
+            activeforeground=C_TEXT,
+            relief="flat",
+            command=self._confirm_shutdown,
+            cursor="hand2"
+        ).grid(row=sep_row + 2, column=0, columnspan=2,
+               sticky="ew", padx=14, pady=(0, 12))
 
     # ── Button handlers ───────────────────────────────────────
 
-    def _press(self, motor_id: str, direction: int, btn: tk.Button):
+    def _press(self, motor_id: str, direction: int,
+               btn: tk.Button, side: str):
         btn.configure(bg=C_BTN_PRESS, fg=C_BG)
         self._ui_held[motor_id] = direction
         self.daemon.send_command(
             self._ui_held["a"], self._ui_held["b"], source="UI")
 
-    def _release(self, motor_id: str, btn: tk.Button):
-        btn.configure(bg=C_BTN_NORMAL,
-                      fg=C_UP_TEXT if "UP" in str(btn.cget("text")) else C_DOWN_TEXT)
-        # Restore text color properly
-        text = btn.cget("text")
-        btn.configure(fg=C_UP_TEXT if "UP" in text else C_DOWN_TEXT)
+    def _release(self, motor_id: str, btn: tk.Button, side: str):
+        fg = C_UP_TEXT if side == "up" else C_DOWN_TEXT
+        btn.configure(bg=C_BTN_NORMAL, fg=fg)
         self._ui_held[motor_id] = CMD_STOP
         self.daemon.send_command(
             self._ui_held["a"], self._ui_held["b"], source="UI")
+
+    def _quit(self):
+        self.daemon.stop()
+        self.root.destroy()
+
+    def _confirm_shutdown(self):
+        """Show confirmation dialog before shutting down."""
+        confirmed = msgbox.askyesno(
+            title="Shutdown",
+            message="Shutdown the Raspberry Pi?\n\nAll motor commands will stop.",
+            icon=msgbox.WARNING,
+            default=msgbox.NO
+        )
+        if confirmed:
+            self.daemon.stop()
+            subprocess.run(["sudo", "shutdown", "-h", "now"])
 
     # ── Refresh ───────────────────────────────────────────────
 
@@ -318,7 +350,11 @@ class MotorControlApp:
         s = self.daemon.get_status()
 
         # ── Status bar ──
-        if s["connected"]:
+        if not s["socket_ready"]:
+            self._conn_var.set("◌  WAITING FOR NETWORK")
+            self._conn_lbl.configure(fg=C_DIM)
+            self._lat_var.set("")
+        elif s["connected"]:
             self._conn_var.set("●  LINK  OK")
             self._conn_lbl.configure(fg=C_GREEN)
             self._lat_var.set(f"RTT {s['latency_ms']} ms")
@@ -339,19 +375,24 @@ class MotorControlApp:
         self._state_lbl_b.configure(fg=motor_color(s["motor_b"]))
 
         # ── Console rows ──
-        eth_c = C_GREEN if s["connected"] else C_RED
-        self._set_row("eth_status",
-                      "OK" if s["connected"] else "LOST", eth_c)
+        if not s["socket_ready"]:
+            self._set_row("eth_status", "NO SOCKET", C_DIM)
+        else:
+            eth_c = C_GREEN if s["connected"] else C_RED
+            self._set_row("eth_status",
+                          "OK" if s["connected"] else "LOST", eth_c)
 
         self._set_row("latency",
-                      f"{s['latency_ms']} ms",
+                      f"{s['latency_ms']} ms" if s["connected"] else "—",
                       C_GREEN if s["latency_ms"] < 50 else C_YELLOW)
 
-        self._set_row("hb_rate",   f"{s['hb_rate_hz']} Hz")
+        self._set_row("hb_rate",
+                      f"{s['hb_rate_hz']} Hz" if s["socket_ready"] else "—")
 
         age = s["last_pkt_age_ms"]
         age_c = C_GREEN if age < 300 else (C_YELLOW if age < 600 else C_RED)
-        self._set_row("last_pkt_age", f"{age} ms", age_c)
+        self._set_row("last_pkt_age",
+                      f"{age} ms" if s["last_ack_time"] > 0 else "—", age_c)
 
         lost = s["lost_since_conn"]
         self._set_row("lost", str(lost),
@@ -361,15 +402,14 @@ class MotorControlApp:
                       state_label(s["motor_a"]), motor_color(s["motor_a"]))
         self._set_row("motor_b",
                       state_label(s["motor_b"]), motor_color(s["motor_b"]))
-
         self._set_row("cmd_source", s["cmd_source"],
                       C_ACCENT if s["cmd_source"] == "HW Button" else C_TEXT)
 
         temp_str = get_pi_temp()
         try:
             temp_val = float(temp_str.replace("°C", ""))
-            temp_c = C_RED if temp_val > 75 else (
-                C_YELLOW if temp_val > 60 else C_GREEN)
+            temp_c = (C_RED    if temp_val > 75 else
+                      C_YELLOW if temp_val > 60 else C_GREEN)
         except Exception:
             temp_c = C_TEXT
         self._set_row("pi_temp", temp_str, temp_c)
@@ -379,8 +419,12 @@ class MotorControlApp:
         self._set_row("uptime",  get_pi_uptime())
 
         gpio_str = "ENABLED" if s["gpio_enabled"] else "DISABLED"
-        gpio_c   = C_GREEN   if s["gpio_enabled"] else C_DIM
-        self._set_row("gpio", gpio_str, gpio_c)
+        self._set_row("gpio", gpio_str,
+                      C_GREEN if s["gpio_enabled"] else C_DIM)
+
+        sock_str = "READY" if s["socket_ready"] else "WAITING..."
+        self._set_row("socket", sock_str,
+                      C_GREEN if s["socket_ready"] else C_YELLOW)
 
 
 # ── Entry point ───────────────────────────────────────────────
@@ -390,7 +434,7 @@ def main():
     daemon.start()
 
     root = tk.Tk()
-    app  = MotorControlApp(root, daemon)
+    MotorControlApp(root, daemon)
 
     try:
         root.mainloop()

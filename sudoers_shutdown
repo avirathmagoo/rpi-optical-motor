@@ -1,0 +1,4 @@
+# Allow all users to shutdown without password
+# This file goes in /etc/sudoers.d/shutdown
+# Install with: sudo cp shutdown /etc/sudoers.d/shutdown
+ALL ALL=NOPASSWD: /sbin/shutdown

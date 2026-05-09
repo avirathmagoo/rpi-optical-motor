@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Motor Control
+Comment=Motor Control System UI
+Exec=/usr/bin/python3 /home/pi/motor_control/ui.py
+Icon=utilities-terminal
+Terminal=false
+Categories=Utility;
+StartupNotify=false
