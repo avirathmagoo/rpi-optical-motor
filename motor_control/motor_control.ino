@@ -1,11 +1,23 @@
 // ============================================================
-//  Motor Control Node — Arduino Uno + W5500
-//  Version 2.0
+//  Motor Control Node — Arduino Uno + W5500  —  v3.1
 //
-//  PIN ASSIGNMENTS:
-//  W5500 : CS=10, RST=9, SCK=13, MOSI=11, MISO=12
-//  LEDs  : Green(connected)=3, Red(disconnected)=2, Heartbeat=8
-//  Motors: A_UP=4, A_DOWN=5, B_UP=6, B_DOWN=7
+//  Fixes:
+//  - Ethernet.maintain() called every loop (required for W5500 link)
+//  - parsePacket() guard against partial reads
+//  - Cleaner serial output
+//
+//  PIN ASSIGNMENTS
+//  ───────────────
+//  W5500 : CS=10, RST=9, SCK=13, MOSI=11, MISO=12  (VCC=3.3V)
+//  Pin 2 : LED Red       — Disconnected / watchdog
+//  Pin 3 : LED Green     — Connected
+//  Pin 4 : Motor A UP
+//  Pin 5 : Motor A DOWN
+//  Pin 6 : Motor B UP
+//  Pin 7 : Motor B DOWN
+//  Pin 8 : LED Heartbeat — blinks each valid packet
+//
+//  LED WIRING: Arduino pin → 330Ω → LED(+) → LED(−) → GND
 // ============================================================
 
 #include <SPI.h>
@@ -13,48 +25,50 @@
 #include <EthernetUdp.h>
 
 // ── Network config ───────────────────────────────────────────
-byte        mac[]     = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0x01 };
-IPAddress   localIP   (192, 168, 10, 2);
-IPAddress   piIP      (192, 168, 10, 1);
+byte      mac[]   = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0x01 };
+IPAddress localIP (192, 168, 10, 2);
+IPAddress piIP    (192, 168, 10, 1);
+
 const unsigned int LOCAL_PORT = 5000;
 const unsigned int PI_PORT    = 5001;
 
-// ── Pin assignments ──────────────────────────────────────────
-#define PIN_W5500_CS      10
-#define PIN_W5500_RST      9
-#define PIN_LED_GREEN      3   // Connected indicator
-#define PIN_LED_RED        2   // Disconnected indicator
-#define PIN_LED_HB         8   // Heartbeat blink
-#define PIN_MOTOR_A_UP     4
-#define PIN_MOTOR_A_DOWN   5
-#define PIN_MOTOR_B_UP     6
-#define PIN_MOTOR_B_DOWN   7
+// ── Pins ─────────────────────────────────────────────────────
+const uint8_t PIN_W5500_CS      = 10;
+const uint8_t PIN_W5500_RST     =  9;
+const uint8_t PIN_LED_RED       =  2;
+const uint8_t PIN_LED_GREEN     =  3;
+const uint8_t PIN_MOTOR_A_UP    =  4;
+const uint8_t PIN_MOTOR_A_DOWN  =  5;
+const uint8_t PIN_MOTOR_B_UP    =  6;
+const uint8_t PIN_MOTOR_B_DOWN  =  7;
+const uint8_t PIN_LED_HB        =  8;
 
 // ── Packet constants ─────────────────────────────────────────
-#define MAGIC_CMD    0xAB
-#define MAGIC_ACK    0xBA
-#define TYPE_CMD     0x01
-#define TYPE_HB      0x02
-#define CMD_STOP     0x00
-#define CMD_UP       0x01
-#define CMD_DOWN     0x02
-#define PKT_IN_LEN   6
-#define PKT_OUT_LEN  5
+const uint8_t MAGIC_CMD   = 0xAB;
+const uint8_t MAGIC_ACK   = 0xBA;
+const uint8_t TYPE_CMD    = 0x01;
+const uint8_t TYPE_HB     = 0x02;
+const uint8_t CMD_STOP    = 0x00;
+const uint8_t CMD_UP      = 0x01;
+const uint8_t CMD_DOWN    = 0x02;
+const uint8_t PKT_IN_LEN  = 6;
+const uint8_t PKT_OUT_LEN = 5;
 
 // ── Timing ───────────────────────────────────────────────────
-#define WATCHDOG_MS    600   // Stop motors + go red if silent this long
-#define HB_BLINK_MS     60   // Heartbeat LED on duration
+const unsigned long WATCHDOG_MS  = 600;
+const unsigned long HB_BLINK_MS  =  60;
 
 // ── State ────────────────────────────────────────────────────
-EthernetUDP  udp;
-unsigned long lastPacketMs = 0;
-unsigned long hbLedOnMs    = 0;
-bool          hbLedOn      = false;
-bool          wasConnected = false;
-uint8_t       motorA       = CMD_STOP;
-uint8_t       motorB       = CMD_STOP;
+EthernetUDP   udp;
+unsigned long lastPacketMs  = 0;
+unsigned long hbLedOnMs     = 0;
+bool          hbLedOn       = false;
+bool          wasConnected  = false;
+uint8_t       motorA        = CMD_STOP;
+uint8_t       motorB        = CMD_STOP;
 
 // ── Helpers ──────────────────────────────────────────────────
+
 uint8_t xorChecksum(uint8_t *buf, uint8_t len) {
   uint8_t cs = 0;
   for (uint8_t i = 0; i < len; i++) cs ^= buf[i];
@@ -76,17 +90,15 @@ void applyMotor(uint8_t pinUp, uint8_t pinDown, uint8_t cmd) {
 }
 
 void setConnected(bool connected) {
-  if (connected == wasConnected) return;   // No change, skip
+  if (connected == wasConnected) return;
   wasConnected = connected;
   digitalWrite(PIN_LED_GREEN, connected ? HIGH : LOW);
   digitalWrite(PIN_LED_RED,   connected ? LOW  : HIGH);
-  Serial.println(connected ? F("STATUS: CONNECTED") : F("STATUS: DISCONNECTED"));
-}
-
-void triggerHbLed() {
-  digitalWrite(PIN_LED_HB, HIGH);
-  hbLedOn   = true;
-  hbLedOnMs = millis();
+  if (connected) {
+    Serial.println(F("STATUS: CONNECTED"));
+  } else {
+    Serial.println(F("STATUS: DISCONNECTED — motors stopped"));
+  }
 }
 
 void sendAck(uint8_t seqEcho) {
@@ -101,82 +113,100 @@ void sendAck(uint8_t seqEcho) {
   udp.endPacket();
 }
 
+const char* cmdName(uint8_t cmd) {
+  if (cmd == CMD_UP)   return "UP";
+  if (cmd == CMD_DOWN) return "DOWN";
+  return "STOP";
+}
+
 // ── Setup ─────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  Serial.println(F("Motor Control Node v2.0 starting..."));
+  Serial.println(F("Motor Control Node v3.1 starting..."));
 
-  // Output pins
-  pinMode(PIN_MOTOR_A_UP,   OUTPUT);
-  pinMode(PIN_MOTOR_A_DOWN, OUTPUT);
-  pinMode(PIN_MOTOR_B_UP,   OUTPUT);
-  pinMode(PIN_MOTOR_B_DOWN, OUTPUT);
-  pinMode(PIN_LED_GREEN,    OUTPUT);
-  pinMode(PIN_LED_RED,      OUTPUT);
-  pinMode(PIN_LED_HB,       OUTPUT);
+  // Configure all output pins
+  uint8_t outPins[] = {
+    PIN_MOTOR_A_UP, PIN_MOTOR_A_DOWN,
+    PIN_MOTOR_B_UP, PIN_MOTOR_B_DOWN,
+    PIN_LED_GREEN, PIN_LED_RED, PIN_LED_HB
+  };
+  for (uint8_t i = 0; i < sizeof(outPins); i++) {
+    pinMode(outPins[i], OUTPUT);
+    digitalWrite(outPins[i], LOW);
+  }
 
-  // Start in disconnected state
+  // Safe start state
   stopAllMotors();
-  digitalWrite(PIN_LED_GREEN, LOW);
-  digitalWrite(PIN_LED_RED,   HIGH);
-  digitalWrite(PIN_LED_HB,    LOW);
+  digitalWrite(PIN_LED_RED, HIGH);   // Red until Pi connects
 
   // Reset W5500
   pinMode(PIN_W5500_RST, OUTPUT);
   digitalWrite(PIN_W5500_RST, LOW);
-  delay(80);
+  delay(100);
   digitalWrite(PIN_W5500_RST, HIGH);
-  delay(300);
+  delay(500);   // Give W5500 time to fully come up
 
   Ethernet.init(PIN_W5500_CS);
   Ethernet.begin(mac, localIP);
   delay(500);
 
-  Serial.print(F("IP: "));
+  Serial.print(F("IP address : "));
   Serial.println(Ethernet.localIP());
-  Serial.print(F("Listening on port: "));
+  Serial.print(F("UDP port   : "));
   Serial.println(LOCAL_PORT);
+  Serial.println(F("Waiting for Pi heartbeat..."));
 
   udp.begin(LOCAL_PORT);
-  lastPacketMs = millis();
+  lastPacketMs = millis();   // Don't watchdog-trigger on first boot
 }
 
 // ── Loop ──────────────────────────────────────────────────────
 void loop() {
   unsigned long now = millis();
 
-  // ── Watchdog check ──
+  // ── IMPORTANT: must call every loop for W5500 link maintenance ──
+  Ethernet.maintain();
+
+  // ── Watchdog ──
   bool connected = (now - lastPacketMs) < WATCHDOG_MS;
   if (!connected) stopAllMotors();
   setConnected(connected);
 
-  // ── Heartbeat LED off after blink ──
+  // ── Heartbeat LED off ──
   if (hbLedOn && (now - hbLedOnMs > HB_BLINK_MS)) {
     hbLedOn = false;
     digitalWrite(PIN_LED_HB, LOW);
   }
 
-  // ── Receive packet ──
+  // ── Check for incoming UDP packet ──
   int pktSize = udp.parsePacket();
-  if (pktSize < PKT_IN_LEN) return;
+  if (pktSize <= 0) return;              // Nothing available
+  if (pktSize < PKT_IN_LEN) {           // Too short — drain and discard
+    while (udp.available()) udp.read();
+    return;
+  }
 
   uint8_t buf[PKT_IN_LEN];
-  udp.read(buf, PKT_IN_LEN);
+  int bytesRead = udp.read(buf, PKT_IN_LEN);
+  if (bytesRead < PKT_IN_LEN) return;   // Incomplete read
 
   // Validate magic byte
   if (buf[0] != MAGIC_CMD) return;
 
   // Validate checksum
   if (xorChecksum(buf, PKT_IN_LEN - 1) != buf[PKT_IN_LEN - 1]) {
-    Serial.println(F("Bad checksum — packet dropped"));
+    Serial.println(F("Bad checksum — dropped"));
     return;
   }
 
   uint8_t seq  = buf[1];
   uint8_t type = buf[2];
 
+  // Valid packet — reset watchdog, blink heartbeat LED
   lastPacketMs = now;
-  triggerHbLed();
+  hbLedOn      = true;
+  hbLedOnMs    = now;
+  digitalWrite(PIN_LED_HB, HIGH);
 
   if (type == TYPE_HB) {
     sendAck(seq);
@@ -186,7 +216,12 @@ void loop() {
   if (type == TYPE_CMD) {
     uint8_t cmdA = buf[3];
     uint8_t cmdB = buf[4];
-    if (cmdA > CMD_DOWN || cmdB > CMD_DOWN) return;
+
+    // Sanity check command values
+    if (cmdA > CMD_DOWN || cmdB > CMD_DOWN) {
+      Serial.println(F("Invalid CMD values — dropped"));
+      return;
+    }
 
     motorA = cmdA;
     motorB = cmdB;
@@ -194,9 +229,9 @@ void loop() {
     applyMotor(PIN_MOTOR_B_UP, PIN_MOTOR_B_DOWN, motorB);
 
     Serial.print(F("CMD  A="));
-    Serial.print(motorA);
+    Serial.print(cmdName(motorA));
     Serial.print(F("  B="));
-    Serial.println(motorB);
+    Serial.println(cmdName(motorB));
 
     sendAck(seq);
   }

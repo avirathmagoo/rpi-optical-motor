@@ -1,23 +1,17 @@
 #!/usr/bin/env python3
 """
-motor_daemon.py  —  v3.0
-UDP communication + GPIO hardware buttons and LEDs for Raspberry Pi.
-
-Key reliability feature: socket creation is retried in the background.
-The UI opens instantly even if Ethernet is not connected yet.
-When the cable is plugged in, the daemon connects automatically.
-
-Threads:
-  sender_thread   — sends heartbeat every 250ms or CMD when queued
-  receiver_thread — listens for ACK from Arduino, updates status
-  gpio_thread     — polls hardware buttons at 50ms, drives LEDs
+motor_daemon.py  —  v3.1
+Fixes:
+  - GPIO crash on stop() when GPIO was not fully initialised
+  - Ethernet cable reconnect: properly closes and rebinds socket
+  - Cleaner thread lifecycle
 """
 
 import socket
 import threading
 import time
 
-# ── GPIO setup (graceful fallback) ───────────────────────────
+# ── GPIO setup ────────────────────────────────────────────────
 try:
     import RPi.GPIO as GPIO
     GPIO_AVAILABLE = True
@@ -44,16 +38,19 @@ CMD_DOWN  = 0x02
 HB_INTERVAL   = 0.25   # Heartbeat every 250ms (4Hz)
 COMMS_TIMEOUT = 0.6    # Lost if no ACK for 600ms
 HB_LED_ON_S   = 0.06   # Heartbeat LED blink duration
-SOCKET_RETRY  = 2.0    # Retry socket bind every 2s if not ready
+SOCKET_RETRY  = 2.0    # Retry socket bind every 2s
 
-# ── GPIO Pin assignments ──────────────────────────────────────
+# ── GPIO Pin assignments (BCM) ────────────────────────────────
 PIN_BTN_A_UP   = 17
 PIN_BTN_A_DOWN = 27
 PIN_BTN_B_UP   = 22
 PIN_BTN_B_DOWN = 23
-PIN_LED_GREEN  = 24    # Connected
-PIN_LED_RED    = 25    # Disconnected
-PIN_LED_HB     = 12    # Heartbeat
+PIN_LED_GREEN  = 24
+PIN_LED_RED    = 25
+PIN_LED_HB     = 12
+
+ALL_LED_PINS = [PIN_LED_GREEN, PIN_LED_RED, PIN_LED_HB]
+ALL_BTN_PINS = [PIN_BTN_A_UP, PIN_BTN_A_DOWN, PIN_BTN_B_UP, PIN_BTN_B_DOWN]
 
 
 def xor_checksum(data: bytes) -> int:
@@ -68,23 +65,27 @@ def build_packet(pkt_type: int, motor_a: int, motor_b: int, seq: int) -> bytes:
     return body + bytes([xor_checksum(body)])
 
 
+def _safe_gpio_output(pin: int, value):
+    """Write to GPIO pin, silently ignore if GPIO not ready."""
+    try:
+        GPIO.output(pin, value)
+    except Exception:
+        pass
+
+
 class MotorDaemon:
     def __init__(self):
-        self._seq       = 0
-        self._lock      = threading.Lock()
-        self._running   = False
+        self._seq            = 0
+        self._lock           = threading.Lock()
+        self._running        = False
+        self._gpio_ready     = False   # True only after full GPIO init succeeds
 
-        # Pending command set by UI or GPIO buttons
-        self._pending_cmd = None
+        self._pending_cmd    = None
+        self._hw_held        = {"a": CMD_STOP, "b": CMD_STOP}
 
-        # Hardware button states
-        self._hw_held = {"a": CMD_STOP, "b": CMD_STOP}
+        self._sock           = None
+        self._sock_ready     = False
 
-        # Socket — created lazily when network is available
-        self._sock        = None
-        self._sock_ready  = False
-
-        # Status dict — all UI reads go through get_status()
         self._status = {
             "connected"      : False,
             "last_ack_time"  : 0.0,
@@ -103,30 +104,60 @@ class MotorDaemon:
             "socket_ready"   : False,
         }
 
-        # Internal tracking
-        self._sent_times    = {}
-        self._hb_send_times = []
-        self._was_connected = False
-        self._baseline_sent = 0
-        self._baseline_recv = 0
+        self._sent_times     = {}
+        self._hb_send_times  = []
+        self._was_connected  = False
+        self._baseline_sent  = 0
+        self._baseline_recv  = 0
 
-        # GPIO init
-        if GPIO_AVAILABLE:
+        self._gpio_init()
+
+    # ── GPIO ──────────────────────────────────────────────────
+
+    def _gpio_init(self):
+        if not GPIO_AVAILABLE:
+            return
+        try:
             GPIO.setmode(GPIO.BCM)
             GPIO.setwarnings(False)
-            for pin in [PIN_BTN_A_UP, PIN_BTN_A_DOWN,
-                        PIN_BTN_B_UP, PIN_BTN_B_DOWN]:
+            for pin in ALL_BTN_PINS:
                 GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-            for pin in [PIN_LED_GREEN, PIN_LED_RED, PIN_LED_HB]:
+            for pin in ALL_LED_PINS:
                 GPIO.setup(pin, GPIO.OUT, initial=GPIO.LOW)
             GPIO.output(PIN_LED_RED, GPIO.HIGH)   # Start red
+            self._gpio_ready = True
+            print("[daemon] GPIO initialised OK")
+        except Exception as e:
+            print(f"[daemon] GPIO init failed: {e}")
+            self._gpio_ready = False
+
+    def _gpio_set_leds(self, green: bool, red: bool, hb: bool = False):
+        if not self._gpio_ready:
+            return
+        _safe_gpio_output(PIN_LED_GREEN, GPIO.HIGH if green else GPIO.LOW)
+        _safe_gpio_output(PIN_LED_RED,   GPIO.HIGH if red   else GPIO.LOW)
+        _safe_gpio_output(PIN_LED_HB,    GPIO.HIGH if hb    else GPIO.LOW)
 
     # ── Socket management ─────────────────────────────────────
 
+    def _close_socket(self):
+        """Close current socket cleanly."""
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+            self._sock = None
+        self._sock_ready = False
+        with self._lock:
+            self._status["socket_ready"] = False
+
     def _try_bind_socket(self) -> bool:
-        """Try to create and bind the UDP socket. Returns True on success."""
+        """Close old socket and try to create a fresh one. Returns True on success."""
+        self._close_socket()
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind((LOCAL_IP, LOCAL_PORT))
             s.settimeout(0.05)
             self._sock       = s
@@ -136,7 +167,7 @@ class MotorDaemon:
             print(f"[daemon] Socket bound to {LOCAL_IP}:{LOCAL_PORT}")
             return True
         except OSError as e:
-            print(f"[daemon] Socket not ready yet: {e} — retrying in {SOCKET_RETRY}s")
+            print(f"[daemon] Socket bind failed: {e} — retry in {SOCKET_RETRY}s")
             return False
 
     # ── Public API ────────────────────────────────────────────
@@ -163,21 +194,23 @@ class MotorDaemon:
                          daemon=True, name="sender").start()
         threading.Thread(target=self._receiver_thread,
                          daemon=True, name="receiver").start()
-        if GPIO_AVAILABLE:
+        if self._gpio_ready:
             threading.Thread(target=self._gpio_thread,
                              daemon=True, name="gpio").start()
 
     def stop(self):
         self._running = False
-        if self._sock:
+        self._close_socket()
+
+        # Only touch GPIO if we successfully initialised it
+        if self._gpio_ready:
             try:
-                self._sock.close()
-            except Exception:
-                pass
-        if GPIO_AVAILABLE:
-            for pin in [PIN_LED_GREEN, PIN_LED_RED, PIN_LED_HB]:
-                GPIO.output(pin, GPIO.LOW)
-            GPIO.cleanup()
+                for pin in ALL_LED_PINS:
+                    _safe_gpio_output(pin, GPIO.LOW)
+                GPIO.cleanup()
+            except Exception as e:
+                print(f"[daemon] GPIO cleanup error (safe to ignore): {e}")
+        self._gpio_ready = False
 
     # ── Sender thread ─────────────────────────────────────────
 
@@ -193,40 +226,45 @@ class MotorDaemon:
 
             # ── Ensure socket is ready ──
             if not self._sock_ready:
-                self._try_bind_socket()
-                time.sleep(SOCKET_RETRY)
-                continue
+                self._gpio_set_leds(green=False, red=True)
+                if not self._try_bind_socket():
+                    time.sleep(SOCKET_RETRY)
+                    continue
 
-            # ── Build and send packet ──
+            # ── Build packet ──
             with self._lock:
                 pending = self._pending_cmd
                 self._pending_cmd = None
 
             seq = self._next_seq()
-
             if pending is not None:
                 motor_a, motor_b = pending
                 pkt = build_packet(TYPE_CMD, motor_a, motor_b, seq)
             else:
                 pkt = build_packet(TYPE_HB, CMD_STOP, CMD_STOP, seq)
 
+            # ── Send packet ──
+            send_ok = False
             try:
                 self._sock.sendto(pkt, (ARDUINO_IP, ARDUINO_PORT))
+                send_ok = True
                 now = time.time()
                 with self._lock:
                     self._sent_times[seq] = now
                     self._status["packets_sent"] += 1
                     self._hb_send_times.append(now)
                     cutoff = now - 4.0
-                    self._hb_send_times = [
-                        t for t in self._hb_send_times if t > cutoff]
+                    self._hb_send_times = [t for t in self._hb_send_times
+                                           if t > cutoff]
                     self._status["hb_rate_hz"] = round(
                         len(self._hb_send_times) / 4.0, 1)
-            except OSError:
-                # Socket died (cable pulled etc) — re-bind next cycle
-                self._sock_ready = False
+            except OSError as e:
+                print(f"[daemon] Send error: {e} — rebinding socket")
+                # Socket is dead — tear it down and reconnect next cycle
+                self._close_socket()
                 with self._lock:
-                    self._status["socket_ready"] = False
+                    self._status["connected"]   = False
+                    self._was_connected         = False
                 time.sleep(SOCKET_RETRY)
                 continue
 
@@ -237,32 +275,36 @@ class MotorDaemon:
                              self._status["last_ack_time"] > 0)
 
                 if connected and not self._was_connected:
-                    # Just reconnected
-                    self._baseline_sent = self._status["packets_sent"]
-                    self._baseline_recv = self._status["packets_recv"]
+                    # Just reconnected — reset counters
+                    self._baseline_sent             = self._status["packets_sent"]
+                    self._baseline_recv             = self._status["packets_recv"]
                     self._status["session_start"]   = time.time()
                     self._status["lost_since_conn"] = 0
+                    print("[daemon] Connection established")
 
-                self._was_connected     = connected
+                if not connected and self._was_connected:
+                    print("[daemon] Connection lost")
+
+                self._was_connected       = connected
                 self._status["connected"] = connected
 
                 if connected:
-                    sent = (self._status["packets_sent"] - self._baseline_sent)
-                    recv = (self._status["packets_recv"] - self._baseline_recv)
+                    sent = self._status["packets_sent"] - self._baseline_sent
+                    recv = self._status["packets_recv"] - self._baseline_recv
                     self._status["lost_since_conn"] = max(0, sent - recv)
 
             # ── GPIO LEDs ──
-            if GPIO_AVAILABLE:
+            if self._gpio_ready:
                 with self._lock:
                     conn = self._status["connected"]
-                GPIO.output(PIN_LED_GREEN, GPIO.HIGH if conn else GPIO.LOW)
-                GPIO.output(PIN_LED_RED,   GPIO.LOW  if conn else GPIO.HIGH)
+                self._gpio_set_leds(green=conn, red=not conn)
 
-                # HB LED off timer
+                # HB LED blink
                 if time.time() > hb_led_off_time:
-                    GPIO.output(PIN_LED_HB, GPIO.LOW)
-                GPIO.output(PIN_LED_HB, GPIO.HIGH)
-                hb_led_off_time = time.time() + HB_LED_ON_S
+                    _safe_gpio_output(PIN_LED_HB, GPIO.LOW)
+                if send_ok:
+                    _safe_gpio_output(PIN_LED_HB, GPIO.HIGH)
+                    hb_led_off_time = time.time() + HB_LED_ON_S
 
             elapsed   = time.time() - loop_start
             sleep_for = HB_INTERVAL - elapsed
@@ -273,9 +315,8 @@ class MotorDaemon:
 
     def _receiver_thread(self):
         while self._running:
-            # Wait until socket is ready
             if not self._sock_ready or self._sock is None:
-                time.sleep(0.5)
+                time.sleep(0.2)
                 continue
 
             try:
@@ -283,7 +324,8 @@ class MotorDaemon:
             except socket.timeout:
                 continue
             except OSError:
-                time.sleep(0.5)
+                # Socket died — sender thread will handle rebind
+                time.sleep(0.2)
                 continue
 
             if len(data) < 5:
@@ -309,19 +351,21 @@ class MotorDaemon:
                     self._status["latency_ms"] = round(
                         (now - sent_t) * 1000, 1)
                 cutoff = now - 3.0
-                self._sent_times = {
-                    k: v for k, v in self._sent_times.items()
-                    if v > cutoff}
+                self._sent_times = {k: v for k, v in self._sent_times.items()
+                                    if v > cutoff}
 
-    # ── GPIO thread ──────────────────────────────────────────
+    # ── GPIO thread ───────────────────────────────────────────
 
     def _gpio_thread(self):
-        """Poll hardware buttons at 50ms. Buttons are active LOW."""
         while self._running:
-            a_up   = not GPIO.input(PIN_BTN_A_UP)
-            a_down = not GPIO.input(PIN_BTN_A_DOWN)
-            b_up   = not GPIO.input(PIN_BTN_B_UP)
-            b_down = not GPIO.input(PIN_BTN_B_DOWN)
+            try:
+                a_up   = not GPIO.input(PIN_BTN_A_UP)
+                a_down = not GPIO.input(PIN_BTN_A_DOWN)
+                b_up   = not GPIO.input(PIN_BTN_B_UP)
+                b_down = not GPIO.input(PIN_BTN_B_DOWN)
+            except Exception:
+                time.sleep(0.1)
+                continue
 
             motor_a = CMD_UP   if a_up   else (CMD_DOWN if a_down else CMD_STOP)
             motor_b = CMD_UP   if b_up   else (CMD_DOWN if b_down else CMD_STOP)
