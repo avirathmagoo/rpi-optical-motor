@@ -1,10 +1,11 @@
 // ============================================================
-//  Motor Control Node — Arduino Uno + W5500  —  v3.1
+//  Motor Control Node — Arduino Uno + W5500  —  v3.2
 //
-//  Fixes:
-//  - Ethernet.maintain() called every loop (required for W5500 link)
-//  - parsePacket() guard against partial reads
-//  - Cleaner serial output
+//  Changes from v3.1:
+//  - Added FIRE command (TYPE_FIRE 0x03): activates relay for
+//    a set duration, then releases automatically
+//  - RELAY_DURATION_MS: adjust this to set how long the relay
+//    stays energised per FIRE pulse (default 500 ms)
 //
 //  PIN ASSIGNMENTS
 //  ───────────────
@@ -16,6 +17,7 @@
 //  Pin 6 : Motor B UP
 //  Pin 7 : Motor B DOWN
 //  Pin 8 : LED Heartbeat — blinks each valid packet
+//  Pin A0: RELAY output  — active HIGH for RELAY_DURATION_MS
 //
 //  LED WIRING: Arduino pin → 330Ω → LED(+) → LED(−) → GND
 // ============================================================
@@ -37,17 +39,22 @@ const uint8_t PIN_W5500_CS      = 10;
 const uint8_t PIN_W5500_RST     =  9;
 const uint8_t PIN_LED_RED       =  2;
 const uint8_t PIN_LED_GREEN     =  3;
-const uint8_t PIN_MOTOR_A_UP    =  4;
-const uint8_t PIN_MOTOR_A_DOWN  =  5;
-const uint8_t PIN_MOTOR_B_UP    =  6;
-const uint8_t PIN_MOTOR_B_DOWN  =  7;
-const uint8_t PIN_LED_HB        =  8;
+const uint8_t PIN_MOTOR_A_UP    =  5;
+const uint8_t PIN_MOTOR_A_DOWN  =  6;
+const uint8_t PIN_MOTOR_B_UP    =  7;
+const uint8_t PIN_MOTOR_B_DOWN  =  8;
+const uint8_t PIN_LED_HB        =  4;
+const uint8_t PIN_RELAY         = A0;   // Relay output pin
+
+// ── Relay timing — ADJUST THIS to set relay pulse duration ───
+const unsigned long RELAY_DURATION_MS = 500;   // milliseconds
 
 // ── Packet constants ─────────────────────────────────────────
 const uint8_t MAGIC_CMD   = 0xAB;
 const uint8_t MAGIC_ACK   = 0xBA;
 const uint8_t TYPE_CMD    = 0x01;
 const uint8_t TYPE_HB     = 0x02;
+const uint8_t TYPE_FIRE   = 0x03;   // One-shot relay trigger
 const uint8_t CMD_STOP    = 0x00;
 const uint8_t CMD_UP      = 0x01;
 const uint8_t CMD_DOWN    = 0x02;
@@ -62,7 +69,9 @@ const unsigned long HB_BLINK_MS  =  60;
 EthernetUDP   udp;
 unsigned long lastPacketMs  = 0;
 unsigned long hbLedOnMs     = 0;
+unsigned long relayOnMs     = 0;
 bool          hbLedOn       = false;
+bool          relayActive   = false;
 bool          wasConnected  = false;
 uint8_t       motorA        = CMD_STOP;
 uint8_t       motorB        = CMD_STOP;
@@ -78,15 +87,23 @@ uint8_t xorChecksum(uint8_t *buf, uint8_t len) {
 void stopAllMotors() {
   motorA = CMD_STOP;
   motorB = CMD_STOP;
-  digitalWrite(PIN_MOTOR_A_UP,   LOW);
-  digitalWrite(PIN_MOTOR_A_DOWN, LOW);
-  digitalWrite(PIN_MOTOR_B_UP,   LOW);
-  digitalWrite(PIN_MOTOR_B_DOWN, LOW);
+  digitalWrite(PIN_MOTOR_A_UP,   HIGH);
+  digitalWrite(PIN_MOTOR_A_DOWN, HIGH);
+  digitalWrite(PIN_MOTOR_B_UP,   HIGH);
+  digitalWrite(PIN_MOTOR_B_DOWN, HIGH);
 }
 
 void applyMotor(uint8_t pinUp, uint8_t pinDown, uint8_t cmd) {
-  digitalWrite(pinUp,   (cmd == CMD_UP)   ? HIGH : LOW);
-  digitalWrite(pinDown, (cmd == CMD_DOWN) ? HIGH : LOW);
+  digitalWrite(pinUp,   (cmd == CMD_UP)   ? LOW : HIGH);
+  digitalWrite(pinDown, (cmd == CMD_DOWN) ? LOW : HIGH);
+}
+
+void fireRelay() {
+  if (relayActive) return;   // Ignore if already firing (one-shot guard)
+  relayActive = true;
+  relayOnMs   = millis();
+  digitalWrite(PIN_RELAY, HIGH);
+  Serial.println(F("FIRE — relay ON"));
 }
 
 void setConnected(bool connected) {
@@ -122,13 +139,14 @@ const char* cmdName(uint8_t cmd) {
 // ── Setup ─────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  Serial.println(F("Motor Control Node v3.1 starting..."));
+  Serial.println(F("Motor Control Node v3.2 starting..."));
 
   // Configure all output pins
   uint8_t outPins[] = {
     PIN_MOTOR_A_UP, PIN_MOTOR_A_DOWN,
     PIN_MOTOR_B_UP, PIN_MOTOR_B_DOWN,
-    PIN_LED_GREEN, PIN_LED_RED, PIN_LED_HB
+    PIN_LED_GREEN, PIN_LED_RED, PIN_LED_HB,
+    PIN_RELAY
   };
   for (uint8_t i = 0; i < sizeof(outPins); i++) {
     pinMode(outPins[i], OUTPUT);
@@ -137,6 +155,7 @@ void setup() {
 
   // Safe start state
   stopAllMotors();
+  digitalWrite(PIN_RELAY,   LOW);    // Relay off
   digitalWrite(PIN_LED_RED, HIGH);   // Red until Pi connects
 
   // Reset W5500
@@ -144,20 +163,24 @@ void setup() {
   digitalWrite(PIN_W5500_RST, LOW);
   delay(100);
   digitalWrite(PIN_W5500_RST, HIGH);
-  delay(500);   // Give W5500 time to fully come up
+  delay(500);
 
   Ethernet.init(PIN_W5500_CS);
   Ethernet.begin(mac, localIP);
   delay(500);
 
-  Serial.print(F("IP address : "));
+  Serial.print(F("IP address       : "));
   Serial.println(Ethernet.localIP());
-  Serial.print(F("UDP port   : "));
+  Serial.print(F("UDP port         : "));
   Serial.println(LOCAL_PORT);
+  Serial.print(F("Relay pin        : A0"));
+  Serial.println();
+  Serial.print(F("Relay duration ms: "));
+  Serial.println(RELAY_DURATION_MS);
   Serial.println(F("Waiting for Pi heartbeat..."));
 
   udp.begin(LOCAL_PORT);
-  lastPacketMs = millis();   // Don't watchdog-trigger on first boot
+  lastPacketMs = millis();
 }
 
 // ── Loop ──────────────────────────────────────────────────────
@@ -178,22 +201,27 @@ void loop() {
     digitalWrite(PIN_LED_HB, LOW);
   }
 
+  // ── Relay auto-release ──
+  if (relayActive && (now - relayOnMs >= RELAY_DURATION_MS)) {
+    relayActive = false;
+    digitalWrite(PIN_RELAY, LOW);
+    Serial.println(F("FIRE — relay OFF"));
+  }
+
   // ── Check for incoming UDP packet ──
   int pktSize = udp.parsePacket();
-  if (pktSize <= 0) return;              // Nothing available
-  if (pktSize < PKT_IN_LEN) {           // Too short — drain and discard
+  if (pktSize <= 0) return;
+  if (pktSize < PKT_IN_LEN) {
     while (udp.available()) udp.read();
     return;
   }
 
   uint8_t buf[PKT_IN_LEN];
   int bytesRead = udp.read(buf, PKT_IN_LEN);
-  if (bytesRead < PKT_IN_LEN) return;   // Incomplete read
+  if (bytesRead < PKT_IN_LEN) return;
 
-  // Validate magic byte
   if (buf[0] != MAGIC_CMD) return;
 
-  // Validate checksum
   if (xorChecksum(buf, PKT_IN_LEN - 1) != buf[PKT_IN_LEN - 1]) {
     Serial.println(F("Bad checksum — dropped"));
     return;
@@ -217,7 +245,6 @@ void loop() {
     uint8_t cmdA = buf[3];
     uint8_t cmdB = buf[4];
 
-    // Sanity check command values
     if (cmdA > CMD_DOWN || cmdB > CMD_DOWN) {
       Serial.println(F("Invalid CMD values — dropped"));
       return;
@@ -234,5 +261,12 @@ void loop() {
     Serial.println(cmdName(motorB));
 
     sendAck(seq);
+    return;
+  }
+
+  if (type == TYPE_FIRE) {
+    fireRelay();
+    sendAck(seq);
+    return;
   }
 }

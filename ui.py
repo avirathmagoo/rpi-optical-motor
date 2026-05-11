@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-ui.py  —  v3.0
-Industrial SCADA-style touchscreen UI for motor control.
-- Opens instantly even without Ethernet connected
-- Fullscreen on launch
-- Shutdown Pi button built in
-- Quit button for development only
-- Pure tkinter, no external UI libraries
+ui.py  —  v3.2
+Changes from v3.0:
+  - Title changed to OPTICAL FIBER MOTOR CONTROL AND TRIGGER
+  - FIRE button added to top of console panel (red, one-shot)
+  - Removed LAST PKT AGE from console rows
+  - QUIT and SHUTDOWN remain at bottom of console
 """
 
 import tkinter as tk
@@ -35,10 +34,13 @@ C_BTN_BORDER = "#333333"
 C_UP_TEXT    = "#00c853"
 C_DOWN_TEXT  = "#d50000"
 C_SHUTDOWN   = "#8b0000"
+C_FIRE_IDLE  = "#5a0000"    # Dark red when idle
+C_FIRE_PRESS = "#ff1a1a"    # Bright red flash on press
 
-# ── Fonts (customised by user) ────────────────────────────────
+# ── Fonts ─────────────────────────────────────────────────────
 F_TITLE   = ("Courier", 13, "bold")
 F_BTN     = ("Courier", 20, "bold")
+F_FIRE    = ("Courier", 18, "bold")
 F_LABEL   = ("Courier", 11, "bold")
 F_CONSOLE = ("Courier", 10)
 F_VALUE   = ("Courier", 12, "bold")
@@ -110,17 +112,17 @@ class MotorControlApp:
         self.root   = root
         self.daemon = daemon
         self._ui_held = {"a": CMD_STOP, "b": CMD_STOP}
+        self._fire_flash_id = None   # pending after() id for flash reset
         self._build_ui()
         self._schedule_refresh()
 
     # ── UI Construction ───────────────────────────────────────
 
     def _build_ui(self):
-        self.root.title("MOTOR CONTROL  v3.0")
+        self.root.title("OPTICAL FIBER MOTOR CONTROL AND TRIGGER  v3.2")
         self.root.configure(bg=C_BG)
         self.root.attributes("-fullscreen", True)
 
-        # Allow Escape to exit fullscreen during development
         self.root.bind("<Escape>",
                        lambda e: self.root.attributes("-fullscreen", False))
 
@@ -144,7 +146,8 @@ class MotorControlApp:
         bar.pack(fill=tk.X)
         bar.pack_propagate(False)
 
-        tk.Label(bar, text="▶  MOTOR CONTROL SYSTEM  v3.0",
+        tk.Label(bar,
+                 text="▶  OPTICAL FIBER MOTOR CONTROL AND TRIGGER  v3.2",
                  font=F_TITLE, bg=C_PANEL, fg=C_ACCENT).pack(
                      side=tk.LEFT, padx=16)
 
@@ -227,32 +230,56 @@ class MotorControlApp:
         frame.columnconfigure(0, weight=1)
         frame.columnconfigure(1, weight=1)
 
+        # ── Section heading ──
         tk.Label(frame, text="━━  SYSTEM CONSOLE  ━━",
                  font=F_SECTION, bg=C_PANEL, fg=C_ACCENT).grid(
-                     row=0, column=0, columnspan=2, pady=(10, 6))
+                     row=0, column=0, columnspan=2, pady=(10, 4))
 
+        # ── FIRE button — top of console, full width, prominent ──
+        fire_outer = tk.Frame(frame, bg="#3a0000", padx=2, pady=2)
+        fire_outer.grid(row=1, column=0, columnspan=2,
+                        sticky="ew", padx=14, pady=(2, 8))
+        fire_outer.columnconfigure(0, weight=1)
+
+        self._fire_btn = tk.Button(
+            fire_outer,
+            text="🔴  FIRE",
+            font=F_FIRE,
+            bg=C_FIRE_IDLE,
+            fg="#ff6666",
+            activebackground=C_FIRE_IDLE,
+            activeforeground="#ff6666",
+            relief="flat",
+            borderwidth=0,
+            cursor="hand2",
+            pady=10,
+        )
+        self._fire_btn.grid(row=0, column=0, sticky="ew")
+        self._fire_btn.bind("<ButtonPress-1>",   self._fire_press)
+        self._fire_btn.bind("<ButtonRelease-1>", self._fire_release)
+
+        # ── Console data rows ──
         self._crows = {}
         rows = [
-            ("_hdr_comms",   "── COMMUNICATIONS ──", None),
-            ("eth_status",   "ETH LINK",             "—"),
-            ("latency",      "LATENCY",               "—"),
-            ("hb_rate",      "HB RATE",               "—"),
-            ("last_pkt_age", "LAST PKT AGE",          "—"),
-            ("lost",         "PKTS LOST",             "0"),
-            ("_hdr_motors",  "── MOTORS ──",          None),
-            ("motor_a",      "MOTOR A",               "STOP"),
-            ("motor_b",      "MOTOR B",               "STOP"),
-            ("cmd_source",   "CMD SOURCE",            "—"),
-            ("_hdr_sys",     "── SYSTEM ──",          None),
-            ("pi_temp",      "PI TEMP",               "—"),
-            ("cpu",          "CPU LOAD",              "—"),
-            ("session",      "SESSION TIME",          "—"),
-            ("uptime",       "UPTIME",                "—"),
-            ("gpio",         "HW BUTTONS",            "—"),
-            ("socket",       "SOCKET",                "—"),
+            ("_hdr_comms",  "── COMMUNICATIONS ──", None),
+            ("eth_status",  "ETH LINK",             "—"),
+            ("latency",     "LATENCY",               "—"),
+            ("hb_rate",     "HB RATE",               "—"),
+            ("lost",        "PKTS LOST",             "0"),
+            ("_hdr_motors", "── MOTORS ──",          None),
+            ("motor_a",     "MOTOR A",               "STOP"),
+            ("motor_b",     "MOTOR B",               "STOP"),
+            ("cmd_source",  "CMD SOURCE",            "—"),
+            ("_hdr_sys",    "── SYSTEM ──",          None),
+            ("pi_temp",     "PI TEMP",               "—"),
+            ("cpu",         "CPU LOAD",              "—"),
+            ("session",     "SESSION TIME",          "—"),
+            ("uptime",      "UPTIME",                "—"),
+            ("gpio",        "HW BUTTONS",            "—"),
+            ("socket",      "SOCKET",                "—"),
         ]
 
-        for i, row in enumerate(rows, start=1):
+        for i, row in enumerate(rows, start=2):   # start=2: row 0=title, row 1=fire btn
             key, label, default = row
             if key.startswith("_hdr"):
                 tk.Label(frame, text=label,
@@ -273,7 +300,7 @@ class MotorControlApp:
             self._crows[key] = (var, lbl)
 
         # ── Divider ──
-        sep_row = len(rows) + 2
+        sep_row = len(rows) + 3
         tk.Frame(frame, bg=C_BORDER, height=1).grid(
             row=sep_row, column=0, columnspan=2,
             sticky="ew", padx=10, pady=8)
@@ -318,12 +345,28 @@ class MotorControlApp:
         self.daemon.send_command(
             self._ui_held["a"], self._ui_held["b"], source="UI")
 
+    def _fire_press(self, event=None):
+        """Send a single FIRE pulse and flash the button bright red."""
+        self.daemon.send_fire(source="UI")
+        self._fire_btn.configure(bg=C_FIRE_PRESS, fg="#ffffff")
+        # Cancel any pending reset
+        if self._fire_flash_id is not None:
+            self.root.after_cancel(self._fire_flash_id)
+        # Reset colour after 200 ms
+        self._fire_flash_id = self.root.after(200, self._fire_reset)
+
+    def _fire_release(self, event=None):
+        pass   # No action on release — fire is one-shot on press only
+
+    def _fire_reset(self):
+        self._fire_btn.configure(bg=C_FIRE_IDLE, fg="#ff6666")
+        self._fire_flash_id = None
+
     def _quit(self):
         self.daemon.stop()
         self.root.destroy()
 
     def _confirm_shutdown(self):
-        """Show confirmation dialog before shutting down."""
         confirmed = msgbox.askyesno(
             title="Shutdown",
             message="Shutdown the Raspberry Pi?\n\nAll motor commands will stop.",
@@ -388,11 +431,6 @@ class MotorControlApp:
 
         self._set_row("hb_rate",
                       f"{s['hb_rate_hz']} Hz" if s["socket_ready"] else "—")
-
-        age = s["last_pkt_age_ms"]
-        age_c = C_GREEN if age < 300 else (C_YELLOW if age < 600 else C_RED)
-        self._set_row("last_pkt_age",
-                      f"{age} ms" if s["last_ack_time"] > 0 else "—", age_c)
 
         lost = s["lost_since_conn"]
         self._set_row("lost", str(lost),

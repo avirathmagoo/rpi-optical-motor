@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-motor_daemon.py  —  v3.1
-Fixes:
-  - GPIO crash on stop() when GPIO was not fully initialised
-  - Ethernet cable reconnect: properly closes and rebinds socket
-  - Cleaner thread lifecycle
+motor_daemon.py  —  v3.2
+Changes from v3.1:
+  - Added CMD_FIRE / TYPE_FIRE one-shot packet
+  - Added hardware FIRE button on GPIO pin (PIN_BTN_FIRE)
+  - send_fire() method sends a single FIRE packet (not repeated)
 """
 
 import socket
@@ -30,6 +30,7 @@ MAGIC_CMD = 0xAB
 MAGIC_ACK = 0xBA
 TYPE_CMD  = 0x01
 TYPE_HB   = 0x02
+TYPE_FIRE = 0x03   # One-shot relay trigger
 CMD_STOP  = 0x00
 CMD_UP    = 0x01
 CMD_DOWN  = 0x02
@@ -45,12 +46,14 @@ PIN_BTN_A_UP   = 17
 PIN_BTN_A_DOWN = 27
 PIN_BTN_B_UP   = 22
 PIN_BTN_B_DOWN = 23
+PIN_BTN_FIRE   = 5    # Hardware FIRE button — wire to GND, internal pull-up
 PIN_LED_GREEN  = 24
 PIN_LED_RED    = 25
 PIN_LED_HB     = 12
 
 ALL_LED_PINS = [PIN_LED_GREEN, PIN_LED_RED, PIN_LED_HB]
-ALL_BTN_PINS = [PIN_BTN_A_UP, PIN_BTN_A_DOWN, PIN_BTN_B_UP, PIN_BTN_B_DOWN]
+ALL_BTN_PINS = [PIN_BTN_A_UP, PIN_BTN_A_DOWN, PIN_BTN_B_UP, PIN_BTN_B_DOWN,
+                PIN_BTN_FIRE]
 
 
 def xor_checksum(data: bytes) -> int:
@@ -78,10 +81,12 @@ class MotorDaemon:
         self._seq            = 0
         self._lock           = threading.Lock()
         self._running        = False
-        self._gpio_ready     = False   # True only after full GPIO init succeeds
+        self._gpio_ready     = False
 
         self._pending_cmd    = None
+        self._pending_fire   = False   # One-shot fire flag
         self._hw_held        = {"a": CMD_STOP, "b": CMD_STOP}
+        self._hw_fire_prev   = False   # Previous state of HW fire button
 
         self._sock           = None
         self._sock_ready     = False
@@ -141,7 +146,6 @@ class MotorDaemon:
     # ── Socket management ─────────────────────────────────────
 
     def _close_socket(self):
-        """Close current socket cleanly."""
         if self._sock is not None:
             try:
                 self._sock.close()
@@ -153,7 +157,6 @@ class MotorDaemon:
             self._status["socket_ready"] = False
 
     def _try_bind_socket(self) -> bool:
-        """Close old socket and try to create a fresh one. Returns True on success."""
         self._close_socket()
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -175,6 +178,12 @@ class MotorDaemon:
     def send_command(self, motor_a: int, motor_b: int, source: str = "UI"):
         with self._lock:
             self._pending_cmd = (motor_a, motor_b)
+            self._status["cmd_source"] = source
+
+    def send_fire(self, source: str = "UI"):
+        """Queue a single FIRE packet. Ignored if one is already pending."""
+        with self._lock:
+            self._pending_fire = True
             self._status["cmd_source"] = source
 
     def get_status(self) -> dict:
@@ -202,7 +211,6 @@ class MotorDaemon:
         self._running = False
         self._close_socket()
 
-        # Only touch GPIO if we successfully initialised it
         if self._gpio_ready:
             try:
                 for pin in ALL_LED_PINS:
@@ -233,11 +241,17 @@ class MotorDaemon:
 
             # ── Build packet ──
             with self._lock:
-                pending = self._pending_cmd
-                self._pending_cmd = None
+                pending      = self._pending_cmd
+                fire_pending = self._pending_fire
+                self._pending_cmd  = None
+                self._pending_fire = False
 
             seq = self._next_seq()
-            if pending is not None:
+
+            if fire_pending:
+                # FIRE packet takes priority — sends TYPE_FIRE, one shot only
+                pkt = build_packet(TYPE_FIRE, CMD_STOP, CMD_STOP, seq)
+            elif pending is not None:
                 motor_a, motor_b = pending
                 pkt = build_packet(TYPE_CMD, motor_a, motor_b, seq)
             else:
@@ -260,7 +274,6 @@ class MotorDaemon:
                         len(self._hb_send_times) / 4.0, 1)
             except OSError as e:
                 print(f"[daemon] Send error: {e} — rebinding socket")
-                # Socket is dead — tear it down and reconnect next cycle
                 self._close_socket()
                 with self._lock:
                     self._status["connected"]   = False
@@ -275,7 +288,6 @@ class MotorDaemon:
                              self._status["last_ack_time"] > 0)
 
                 if connected and not self._was_connected:
-                    # Just reconnected — reset counters
                     self._baseline_sent             = self._status["packets_sent"]
                     self._baseline_recv             = self._status["packets_recv"]
                     self._status["session_start"]   = time.time()
@@ -299,7 +311,6 @@ class MotorDaemon:
                     conn = self._status["connected"]
                 self._gpio_set_leds(green=conn, red=not conn)
 
-                # HB LED blink
                 if time.time() > hb_led_off_time:
                     _safe_gpio_output(PIN_LED_HB, GPIO.LOW)
                 if send_ok:
@@ -324,7 +335,6 @@ class MotorDaemon:
             except socket.timeout:
                 continue
             except OSError:
-                # Socket died — sender thread will handle rebind
                 time.sleep(0.2)
                 continue
 
@@ -363,6 +373,7 @@ class MotorDaemon:
                 a_down = not GPIO.input(PIN_BTN_A_DOWN)
                 b_up   = not GPIO.input(PIN_BTN_B_UP)
                 b_down = not GPIO.input(PIN_BTN_B_DOWN)
+                fire   = not GPIO.input(PIN_BTN_FIRE)
             except Exception:
                 time.sleep(0.1)
                 continue
@@ -378,5 +389,12 @@ class MotorDaemon:
 
             if motor_a != prev_a or motor_b != prev_b:
                 self.send_command(motor_a, motor_b, source="HW Button")
+
+            # Fire button: trigger only on rising edge (press, not hold)
+            if fire and not self._hw_fire_prev:
+                self.send_fire(source="HW Button")
+                print("[daemon] HW FIRE button pressed")
+
+            self._hw_fire_prev = fire
 
             time.sleep(0.05)
