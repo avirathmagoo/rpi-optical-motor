@@ -34,8 +34,9 @@ C_BTN_BORDER = "#333333"
 C_UP_TEXT    = "#00c853"
 C_DOWN_TEXT  = "#d50000"
 C_SHUTDOWN   = "#8b0000"
-C_FIRE_IDLE  = "#5a0000"    # Dark red when idle
-C_FIRE_PRESS = "#ff1a1a"    # Bright red flash on press
+C_FIRE_IDLE  = "#004d1a"    # Dark green when idle / ACK received
+C_FIRE_WAIT  = "#5a0000"    # Dark red while waiting for ACK
+C_FIRE_PRESS = "#d50000"    # Bright red on press
 
 # ── Fonts ─────────────────────────────────────────────────────
 F_TITLE   = ("Courier", 13, "bold")
@@ -243,12 +244,12 @@ class MotorControlApp:
 
         self._fire_btn = tk.Button(
             fire_outer,
-            text="🔴  FIRE",
+            text="🟢  FIRE",
             font=F_FIRE,
             bg=C_FIRE_IDLE,
-            fg="#ff6666",
+            fg="#00c853",
             activebackground=C_FIRE_IDLE,
-            activeforeground="#ff6666",
+            activeforeground="#00c853",
             relief="flat",
             borderwidth=0,
             cursor="hand2",
@@ -346,20 +347,20 @@ class MotorControlApp:
             self._ui_held["a"], self._ui_held["b"], source="UI")
 
     def _fire_press(self, event=None):
-        """Send a single FIRE pulse and flash the button bright red."""
+        """Send a single FIRE pulse and turn button red until ACK received."""
         self.daemon.send_fire(source="UI")
-        self._fire_btn.configure(bg=C_FIRE_PRESS, fg="#ffffff")
-        # Cancel any pending reset
+        self._fire_btn.configure(bg=C_FIRE_PRESS, fg="#ffffff", text="🔴  FIRE")
+        # Cancel any pending reset (safety — shouldn't normally be pending)
         if self._fire_flash_id is not None:
             self.root.after_cancel(self._fire_flash_id)
-        # Reset colour after 200 ms
-        self._fire_flash_id = self.root.after(200, self._fire_reset)
+            self._fire_flash_id = None
 
     def _fire_release(self, event=None):
         pass   # No action on release — fire is one-shot on press only
 
     def _fire_reset(self):
-        self._fire_btn.configure(bg=C_FIRE_IDLE, fg="#ff6666")
+        """Called by _refresh when ACK arrives — restore green."""
+        self._fire_btn.configure(bg=C_FIRE_IDLE, fg="#00c853", text="🟢  FIRE")
         self._fire_flash_id = None
 
     def _quit(self):
@@ -463,6 +464,12 @@ class MotorControlApp:
         sock_str = "READY" if s["socket_ready"] else "WAITING..."
         self._set_row("socket", sock_str,
                       C_GREEN if s["socket_ready"] else C_YELLOW)
+
+        # ── FIRE button state — green=idle, red=waiting for ACK ──
+        if not s["fire_ack_pending"] and self._fire_flash_id is None:
+            current_bg = self._fire_btn.cget("bg")
+            if current_bg != C_FIRE_IDLE:
+                self._fire_reset()
 
 
 # ── Entry point ───────────────────────────────────────────────

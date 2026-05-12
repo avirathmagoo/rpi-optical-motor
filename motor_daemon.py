@@ -47,11 +47,12 @@ PIN_BTN_A_DOWN = 27
 PIN_BTN_B_UP   = 22
 PIN_BTN_B_DOWN = 23
 PIN_BTN_FIRE   = 5    # Hardware FIRE button — wire to GND, internal pull-up
-PIN_LED_GREEN  = 24
-PIN_LED_RED    = 25
-PIN_LED_HB     = 12
+PIN_LED_GREEN     = 24
+PIN_LED_RED       = 25
+PIN_LED_HB        = 12
+PIN_LED_FIRE_ACK  = 16   # Blinks when Arduino ACKs a FIRE packet
 
-ALL_LED_PINS = [PIN_LED_GREEN, PIN_LED_RED, PIN_LED_HB]
+ALL_LED_PINS = [PIN_LED_GREEN, PIN_LED_RED, PIN_LED_HB, PIN_LED_FIRE_ACK]
 ALL_BTN_PINS = [PIN_BTN_A_UP, PIN_BTN_A_DOWN, PIN_BTN_B_UP, PIN_BTN_B_DOWN,
                 PIN_BTN_FIRE]
 
@@ -87,6 +88,8 @@ class MotorDaemon:
         self._pending_fire   = False   # One-shot fire flag
         self._hw_held        = {"a": CMD_STOP, "b": CMD_STOP}
         self._hw_fire_prev   = False   # Previous state of HW fire button
+        self._fire_seq       = None    # Seq of most-recently-sent FIRE packet
+        self._fire_ack_off   = 0.0     # Time to turn off FIRE ACK LED
 
         self._sock           = None
         self._sock_ready     = False
@@ -107,6 +110,7 @@ class MotorDaemon:
             "cmd_source"     : "—",
             "gpio_enabled"   : GPIO_AVAILABLE,
             "socket_ready"   : False,
+            "fire_ack_pending": False,   # True from FIRE sent until ACK received
         }
 
         self._sent_times     = {}
@@ -251,6 +255,9 @@ class MotorDaemon:
             if fire_pending:
                 # FIRE packet takes priority — sends TYPE_FIRE, one shot only
                 pkt = build_packet(TYPE_FIRE, CMD_STOP, CMD_STOP, seq)
+                self._fire_seq = seq   # Remember seq to match ACK
+                with self._lock:
+                    self._status["fire_ack_pending"] = True
             elif pending is not None:
                 motor_a, motor_b = pending
                 pkt = build_packet(TYPE_CMD, motor_a, motor_b, seq)
@@ -317,6 +324,9 @@ class MotorDaemon:
                     _safe_gpio_output(PIN_LED_HB, GPIO.HIGH)
                     hb_led_off_time = time.time() + HB_LED_ON_S
 
+                if time.time() > self._fire_ack_off:
+                    _safe_gpio_output(PIN_LED_FIRE_ACK, GPIO.LOW)
+
             elapsed   = time.time() - loop_start
             sleep_for = HB_INTERVAL - elapsed
             if sleep_for > 0:
@@ -363,6 +373,15 @@ class MotorDaemon:
                 cutoff = now - 3.0
                 self._sent_times = {k: v for k, v in self._sent_times.items()
                                     if v > cutoff}
+
+                # If this ACK is for the FIRE packet, blink GPIO 16 for 500 ms
+                if seq_echo == self._fire_seq and self._fire_seq is not None:
+                    self._fire_seq     = None
+                    self._fire_ack_off = now + 0.5
+                    self._status["fire_ack_pending"] = False
+                    if self._gpio_ready:
+                        _safe_gpio_output(PIN_LED_FIRE_ACK, GPIO.HIGH)
+                    print("[daemon] FIRE ACK received — relay confirmed")
 
     # ── GPIO thread ───────────────────────────────────────────
 
