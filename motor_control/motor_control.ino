@@ -1,23 +1,25 @@
 // ============================================================
-//  Motor Control Node — Arduino Uno + W5500  —  v3.2
+//  Motor Control Node — Arduino Uno + W5500  —  v4.0
 //
-//  Changes from v3.1:
-//  - Added FIRE command (TYPE_FIRE 0x03): activates relay for
-//    a set duration, then releases automatically
-//  - RELAY_DURATION_MS: adjust this to set how long the relay
-//    stays energised per FIRE pulse (default 500 ms)
+//  Changes from v3.2:
+//  - FIRE protocol changed from one-shot to hold/release:
+//      TYPE_FIRE_HOLD 0x03 : relay stays ON while packets arrive
+//      TYPE_FIRE_OFF  0x04 : relay turns OFF immediately
+//  - Relay turns OFF automatically if Pi stops sending FIRE_HOLD
+//    (FIRE_WATCHDOG_MS timeout — safety guarantee)
+//  - Relay turns OFF on communications watchdog timeout
 //
-//  PIN ASSIGNMENTS
+//  PIN ASSIGNMENTS  (UNCHANGED from v3.x)
 //  ───────────────
 //  W5500 : CS=10, RST=9, SCK=13, MOSI=11, MISO=12  (VCC=3.3V)
 //  Pin 2 : LED Red       — Disconnected / watchdog
 //  Pin 3 : LED Green     — Connected
-//  Pin 4 : Motor A UP
-//  Pin 5 : Motor A DOWN
-//  Pin 6 : Motor B UP
-//  Pin 7 : Motor B DOWN
-//  Pin 8 : LED Heartbeat — blinks each valid packet
-//  Pin A0: RELAY output  — active HIGH for RELAY_DURATION_MS
+//  Pin 4 : LED Heartbeat — blinks each valid packet
+//  Pin 5 : Motor A UP
+//  Pin 6 : Motor A DOWN
+//  Pin 7 : Motor B UP
+//  Pin 8 : Motor B DOWN
+//  Pin A0: RELAY output  — active HIGH while FIRE_HOLD packets arrive
 //
 //  LED WIRING: Arduino pin → 330Ω → LED(+) → LED(−) → GND
 // ============================================================
@@ -39,42 +41,43 @@ const uint8_t PIN_W5500_CS      = 10;
 const uint8_t PIN_W5500_RST     =  9;
 const uint8_t PIN_LED_RED       =  2;
 const uint8_t PIN_LED_GREEN     =  3;
+const uint8_t PIN_LED_HB        =  4;
 const uint8_t PIN_MOTOR_A_UP    =  5;
 const uint8_t PIN_MOTOR_A_DOWN  =  6;
 const uint8_t PIN_MOTOR_B_UP    =  7;
 const uint8_t PIN_MOTOR_B_DOWN  =  8;
-const uint8_t PIN_LED_HB        =  4;
-const uint8_t PIN_RELAY         = A0;   // Relay output pin
-
-// ── Relay timing — ADJUST THIS to set relay pulse duration ───
-const unsigned long RELAY_DURATION_MS = 500;   // milliseconds
+const uint8_t PIN_RELAY         = A0;   // Relay output — active HIGH
 
 // ── Packet constants ─────────────────────────────────────────
-const uint8_t MAGIC_CMD   = 0xAB;
-const uint8_t MAGIC_ACK   = 0xBA;
-const uint8_t TYPE_CMD    = 0x01;
-const uint8_t TYPE_HB     = 0x02;
-const uint8_t TYPE_FIRE   = 0x03;   // One-shot relay trigger
-const uint8_t CMD_STOP    = 0x00;
-const uint8_t CMD_UP      = 0x01;
-const uint8_t CMD_DOWN    = 0x02;
-const uint8_t PKT_IN_LEN  = 6;
-const uint8_t PKT_OUT_LEN = 5;
+const uint8_t MAGIC_CMD       = 0xAB;
+const uint8_t MAGIC_ACK       = 0xBA;
+const uint8_t TYPE_CMD        = 0x01;
+const uint8_t TYPE_HB         = 0x02;
+const uint8_t TYPE_FIRE_HOLD  = 0x03;   // Relay ON — must keep arriving
+const uint8_t TYPE_FIRE_OFF   = 0x04;   // Relay OFF immediately
+const uint8_t CMD_STOP        = 0x00;
+const uint8_t CMD_UP          = 0x01;
+const uint8_t CMD_DOWN        = 0x02;
+const uint8_t PKT_IN_LEN      = 6;
+const uint8_t PKT_OUT_LEN     = 5;
 
 // ── Timing ───────────────────────────────────────────────────
-const unsigned long WATCHDOG_MS  = 600;
-const unsigned long HB_BLINK_MS  =  60;
+const unsigned long WATCHDOG_MS       = 600;   // Pi comms watchdog
+const unsigned long HB_BLINK_MS       =  60;   // Heartbeat LED blink duration
+// Safety: if FIRE_HOLD packets stop arriving, relay turns off after this.
+// Set to slightly longer than Pi heartbeat interval (250 ms) + margin.
+const unsigned long FIRE_WATCHDOG_MS  = 700;
 
 // ── State ────────────────────────────────────────────────────
 EthernetUDP   udp;
-unsigned long lastPacketMs  = 0;
-unsigned long hbLedOnMs     = 0;
-unsigned long relayOnMs     = 0;
-bool          hbLedOn       = false;
-bool          relayActive   = false;
-bool          wasConnected  = false;
-uint8_t       motorA        = CMD_STOP;
-uint8_t       motorB        = CMD_STOP;
+unsigned long lastPacketMs    = 0;
+unsigned long hbLedOnMs       = 0;
+unsigned long fireHoldLastMs  = 0;  // Last time a FIRE_HOLD packet arrived
+bool          hbLedOn         = false;
+bool          relayActive     = false;
+bool          wasConnected    = false;
+uint8_t       motorA          = CMD_STOP;
+uint8_t       motorB          = CMD_STOP;
 
 // ── Helpers ──────────────────────────────────────────────────
 
@@ -98,12 +101,11 @@ void applyMotor(uint8_t pinUp, uint8_t pinDown, uint8_t cmd) {
   digitalWrite(pinDown, (cmd == CMD_DOWN) ? LOW : HIGH);
 }
 
-void fireRelay() {
-  if (relayActive) return;   // Ignore if already firing (one-shot guard)
-  relayActive = true;
-  relayOnMs   = millis();
-  digitalWrite(PIN_RELAY, HIGH);
-  Serial.println(F("FIRE — relay ON"));
+void setRelay(bool on) {
+  if (on == relayActive) return;
+  relayActive = on;
+  digitalWrite(PIN_RELAY, on ? HIGH : LOW);
+  Serial.println(on ? F("RELAY ON") : F("RELAY OFF"));
 }
 
 void setConnected(bool connected) {
@@ -114,7 +116,7 @@ void setConnected(bool connected) {
   if (connected) {
     Serial.println(F("STATUS: CONNECTED"));
   } else {
-    Serial.println(F("STATUS: DISCONNECTED — motors stopped"));
+    Serial.println(F("STATUS: DISCONNECTED — motors and relay stopped"));
   }
 }
 
@@ -139,9 +141,8 @@ const char* cmdName(uint8_t cmd) {
 // ── Setup ─────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  Serial.println(F("Motor Control Node v3.2 starting..."));
+  Serial.println(F("Motor Control Node v4.0 starting..."));
 
-  // Configure all output pins
   uint8_t outPins[] = {
     PIN_MOTOR_A_UP, PIN_MOTOR_A_DOWN,
     PIN_MOTOR_B_UP, PIN_MOTOR_B_DOWN,
@@ -153,12 +154,10 @@ void setup() {
     digitalWrite(outPins[i], LOW);
   }
 
-  // Safe start state
   stopAllMotors();
-  digitalWrite(PIN_RELAY,   LOW);    // Relay off
-  digitalWrite(PIN_LED_RED, HIGH);   // Red until Pi connects
+  digitalWrite(PIN_RELAY,   LOW);
+  digitalWrite(PIN_LED_RED, HIGH);
 
-  // Reset W5500
   pinMode(PIN_W5500_RST, OUTPUT);
   digitalWrite(PIN_W5500_RST, LOW);
   delay(100);
@@ -169,43 +168,43 @@ void setup() {
   Ethernet.begin(mac, localIP);
   delay(500);
 
-  Serial.print(F("IP address       : "));
+  Serial.print(F("IP address : "));
   Serial.println(Ethernet.localIP());
-  Serial.print(F("UDP port         : "));
+  Serial.print(F("Listening  : port "));
   Serial.println(LOCAL_PORT);
-  Serial.print(F("Relay pin        : A0"));
-  Serial.println();
-  Serial.print(F("Relay duration ms: "));
-  Serial.println(RELAY_DURATION_MS);
   Serial.println(F("Waiting for Pi heartbeat..."));
 
   udp.begin(LOCAL_PORT);
-  lastPacketMs = millis();
+  lastPacketMs   = millis();
+  fireHoldLastMs = millis();
 }
 
 // ── Loop ──────────────────────────────────────────────────────
 void loop() {
   unsigned long now = millis();
 
-  // ── IMPORTANT: must call every loop for W5500 link maintenance ──
   Ethernet.maintain();
 
-  // ── Watchdog ──
+  // ── Pi comms watchdog ──
   bool connected = (now - lastPacketMs) < WATCHDOG_MS;
-  if (!connected) stopAllMotors();
+  if (!connected) {
+    stopAllMotors();
+    setRelay(false);         // Safety: relay off if Pi drops out
+    fireHoldLastMs = now;    // Reset so we don't false-trigger on reconnect
+  }
   setConnected(connected);
+
+  // ── FIRE hold watchdog ──
+  // If relay is active but FIRE_HOLD packets stopped, turn relay off
+  if (relayActive && (now - fireHoldLastMs) >= FIRE_WATCHDOG_MS) {
+    setRelay(false);
+    Serial.println(F("RELAY OFF — FIRE_HOLD timeout"));
+  }
 
   // ── Heartbeat LED off ──
   if (hbLedOn && (now - hbLedOnMs > HB_BLINK_MS)) {
     hbLedOn = false;
     digitalWrite(PIN_LED_HB, LOW);
-  }
-
-  // ── Relay auto-release ──
-  if (relayActive && (now - relayOnMs >= RELAY_DURATION_MS)) {
-    relayActive = false;
-    digitalWrite(PIN_RELAY, LOW);
-    Serial.println(F("FIRE — relay OFF"));
   }
 
   // ── Check for incoming UDP packet ──
@@ -230,7 +229,7 @@ void loop() {
   uint8_t seq  = buf[1];
   uint8_t type = buf[2];
 
-  // Valid packet — reset watchdog, blink heartbeat LED
+  // Valid packet — reset comms watchdog, blink heartbeat LED
   lastPacketMs = now;
   hbLedOn      = true;
   hbLedOnMs    = now;
@@ -264,8 +263,15 @@ void loop() {
     return;
   }
 
-  if (type == TYPE_FIRE) {
-    fireRelay();
+  if (type == TYPE_FIRE_HOLD) {
+    fireHoldLastMs = now;   // Refresh hold watchdog
+    setRelay(true);
+    sendAck(seq);
+    return;
+  }
+
+  if (type == TYPE_FIRE_OFF) {
+    setRelay(false);
     sendAck(seq);
     return;
   }
