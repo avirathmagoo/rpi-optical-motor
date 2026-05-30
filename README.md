@@ -144,13 +144,7 @@ v3/
 | Motors won't stop | Check watchdog timeout — should trigger at 600ms no packet |
 | LED very dim | Resistor too high — try 100Ω (keep Pi GPIO ≤16mA) |
 
-## Critical Precautions
 
-⚠️ **Never remove LED resistors** — GPIO pins will be damaged  
-⚠️ **Never connect W5500 VCC to 5V** — use 3.3V only  
-⚠️ **Never apply 5V to Pi GPIO** — permanently damages the board  
-⚠️ **Max 16mA per Pi GPIO pin** — 220Ω resistor enforces this  
-⚠️ **Power off both devices before wiring** — prevents shorts
 
 ## Future Extension
 
